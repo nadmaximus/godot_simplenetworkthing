@@ -1,0 +1,328 @@
+[gd_scene load_steps=8 format=2]
+
+[ext_resource path="res://console.gd" type="Script" id=1]
+[ext_resource path="res://fonts/Minecraft.ttf" type="DynamicFontData" id=2]
+
+[sub_resource type="Shader" id=1]
+
+code = "shader_type canvas_item;
+
+// Based on crt-easymode
+// https://github.com/libretro/glsl-shaders/blob/master/crt/shaders/crt-easymode.glsl
+
+uniform float screen_base_size = 200.0;
+
+uniform float sharpness_h : hint_range(0.0, 1.0, 0.05); // 0.5
+uniform float sharpness_v : hint_range(0.0, 1.0, 0.05); // 1.0
+uniform float mask_strength : hint_range(0.0, 1.0, 0.01); // 0.3
+uniform float mask_dot_width : hint_range(1.0, 100.0, 1.0); // 1.0
+uniform float mask_dot_height : hint_range(1.0, 100.0, 1.0); // 1.0
+uniform float mask_stagger : hint_range(0.0, 100.0, 1.0); // 0.0
+uniform float mask_size : hint_range(1.0, 100.0, 1.0); // 1.0
+uniform float scanline_strength : hint_range(0.0, 1.0, 0.05); // 1.0
+uniform float scanline_beam_width_min : hint_range(0.5, 5.0, 0.5); // 1.5
+uniform float scanline_beam_width_max : hint_range(0.5, 5.0, 0.5); // 1.5
+uniform float scanline_bright_min : hint_range(0.0, 1.0, 0.05); // 0.35
+uniform float scanline_bright_max : hint_range(0.0, 1.0, 0.05); // 0.65
+uniform float scanline_cutoff : hint_range(1.0, 1000.0, 1.0); // 400.0
+uniform float gamma_input : hint_range(0.1, 5.0, 0.1); // 2.0
+uniform float gamma_output : hint_range(0.1, 5.0, 0.1); // 1.8
+uniform float bright_boost : hint_range(1.0, 2.0, 0.01); // 1.2
+uniform float dilation : hint_range(0.0, 1.0, 1.0); // 1.0
+
+vec4 fix(vec4 c)
+{
+	return vec4(
+				max(abs(c.x), 0.00001),
+				max(abs(c.y), 0.00001),
+				max(abs(c.z), 0.00001),
+				max(abs(c.w), 0.00001)
+			);
+}
+
+vec4 dilate(vec4 col)
+{
+	vec4 x = mix(vec4(1.0), col, dilation);
+	return col * x;
+}
+
+vec4 tex2D(sampler2D tex, vec2 uv)
+{
+	return dilate(textureLod(tex, uv, 0));
+}
+
+float curve_distance(float x, float sharp)
+{
+	float x_step = step(0.5, x);
+	float curve = 0.5 - sqrt(0.25 - (x - x_step) * (x - x_step)) * sign(0.5 - x);
+	return mix(x, curve, sharp);
+}
+
+mat4 get_color_matrix(sampler2D tex, vec2 co, vec2 dx)
+{
+	return mat4(tex2D(tex, co - dx), tex2D(tex, co), tex2D(tex, co + dx), tex2D(tex, co + 2.0 * dx));
+}
+
+vec3 filter_lanczos(vec4 coeffs, mat4 color_matrix)
+{
+	vec4 col = color_matrix * coeffs;
+	vec4 sample_min = min(color_matrix[1], color_matrix[2]);
+	vec4 sample_max = max(color_matrix[1], color_matrix[2]);
+
+	col = clamp(col, sample_min, sample_max);
+
+	return col.rgb;
+}
+
+void fragment()
+{
+	float PI = 3.141592653589;
+
+	vec2 input_size = vec2(textureSize(SCREEN_TEXTURE, 0));
+	if (min(input_size.x, input_size.y) > screen_base_size)
+	{
+		float mult = screen_base_size / min(input_size.x, input_size.y);
+		input_size *= mult;
+	}
+
+	vec4 source_size = vec4(input_size, vec2(1, 1) / input_size);
+	vec4 output_size = vec4(vec2(1, 1) / SCREEN_PIXEL_SIZE, SCREEN_PIXEL_SIZE);
+
+	vec2 dx = vec2(source_size.z, 0.0);
+	vec2 dy = vec2(0.0, source_size.w);
+	vec2 pix_co = SCREEN_UV * source_size.xy - vec2(0.5, 0.5);
+	vec2 tex_co = (floor(pix_co) + vec2(0.5, 0.5)) * source_size.zw;
+	vec2 dist = fract(pix_co);
+
+	float curve_x;
+	vec3 col, col2;
+
+	curve_x = curve_distance(dist.x, sharpness_h * sharpness_h);
+
+	vec4 coeffs = PI * vec4(1.0 + curve_x, curve_x, 1.0 - curve_x, 2.0 - curve_x);
+
+	coeffs = fix(coeffs);
+	coeffs = 2.0 * sin(coeffs) * sin(coeffs * 0.5) / (coeffs * coeffs);
+	coeffs /= dot(coeffs, vec4(1.0));
+
+	col  = filter_lanczos(coeffs, get_color_matrix(SCREEN_TEXTURE, tex_co, dx));
+	col2 = filter_lanczos(coeffs, get_color_matrix(SCREEN_TEXTURE, tex_co + dy, dx));
+
+	col = mix(col, col2, curve_distance(dist.y, sharpness_v));
+	col = pow(col, vec3(gamma_input / (dilation + 1.0)));
+
+	float luma = dot(vec3(0.2126, 0.7152, 0.0722), col);
+	float bright = (max(col.r, max(col.g, col.b)) + luma) * 0.5;
+	float scan_bright = clamp(bright, scanline_bright_min, scanline_bright_max);
+	float scan_beam = clamp(bright * scanline_beam_width_max, scanline_beam_width_min, scanline_beam_width_max);
+	float scan_weight = 1.0 - pow(cos(SCREEN_UV.y * 2.0 * PI * source_size.y) * 0.5 + 0.5, scan_beam) * scanline_strength;
+
+	float mask = 1.0 - mask_strength;
+	vec2 mod_fac = floor(SCREEN_UV * output_size.xy * source_size.xy / (input_size.xy * vec2(mask_size, mask_dot_height * mask_size)));
+	int dot_no = int(mod((mod_fac.x + mod(mod_fac.y, 2.0) * mask_stagger) / mask_dot_width, 3.0));
+	vec3 mask_weight;
+
+	if (dot_no == 0)
+	{
+		mask_weight = vec3(1.0, mask, mask);
+	}
+	else if (dot_no == 1)
+	{
+		mask_weight = vec3(mask, 1.0, mask);
+	}
+	else
+	{
+		mask_weight = vec3(mask, mask, 1.0);
+	}
+
+	if (input_size.y >= scanline_cutoff)
+	{
+		scan_weight = 1.0;
+	}
+
+	col2 = col.rgb;
+	col *= vec3(scan_weight);
+	col = mix(col, col2, scan_bright);
+	col *= mask_weight;
+	col = pow(col, vec3(1.0 / gamma_output));
+
+	COLOR = vec4(col * bright_boost, 1.0);
+}"
+
+[sub_resource type="ShaderMaterial" id=2]
+
+render_priority = 0
+shader = SubResource( 1 )
+shader_param/screen_base_size = 200.0
+shader_param/sharpness_h = 0.5
+shader_param/sharpness_v = 1.0
+shader_param/mask_strength = 0.3
+shader_param/mask_dot_width = 1.0
+shader_param/mask_dot_height = 1.0
+shader_param/mask_stagger = 0.0
+shader_param/mask_size = 1.0
+shader_param/scanline_strength = 1.0
+shader_param/scanline_beam_width_min = 1.5
+shader_param/scanline_beam_width_max = 1.5
+shader_param/scanline_bright_min = 0.35
+shader_param/scanline_bright_max = 0.65
+shader_param/scanline_cutoff = 400.0
+shader_param/gamma_input = 2.0
+shader_param/gamma_output = 1.8
+shader_param/bright_boost = 1.2
+shader_param/dilation = 1.0
+_sections_unfolded = [ "shader_param" ]
+
+[sub_resource type="DynamicFont" id=3]
+
+size = 20
+use_mipmaps = false
+use_filter = false
+extra_spacing_top = 5
+extra_spacing_bottom = 5
+font_data = ExtResource( 2 )
+_sections_unfolded = [ "Extra Spacing", "Font", "Settings" ]
+
+[sub_resource type="DynamicFont" id=4]
+
+size = 24
+use_mipmaps = false
+use_filter = true
+font_data = ExtResource( 2 )
+_sections_unfolded = [ "Extra Spacing", "Font", "Settings" ]
+
+[sub_resource type="DynamicFont" id=5]
+
+size = 24
+use_mipmaps = false
+use_filter = false
+font_data = ExtResource( 2 )
+_sections_unfolded = [ "Font", "Settings" ]
+
+[node name="Console" type="CanvasLayer" index="0"]
+
+layer = 1
+offset = Vector2( 0, 0 )
+rotation = 0.0
+scale = Vector2( 1, 1 )
+transform = Transform2D( 1, 0, 0, 1, 0, 0 )
+script = ExtResource( 1 )
+
+[node name="ConsoleBox" type="Panel" parent="." index="0"]
+
+anchor_left = 0.0
+anchor_top = 0.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+rect_pivot_offset = Vector2( 0, 0 )
+rect_clip_content = false
+mouse_filter = 0
+mouse_default_cursor_shape = 0
+size_flags_horizontal = 1
+size_flags_vertical = 1
+_sections_unfolded = [ "Anchor", "Grow Direction", "Margin", "Material", "Rect", "Size Flags", "Visibility" ]
+
+[node name="Container" type="VBoxContainer" parent="ConsoleBox" index="0"]
+
+material = SubResource( 2 )
+anchor_left = 0.0
+anchor_top = 0.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+rect_pivot_offset = Vector2( 0, 0 )
+rect_clip_content = false
+mouse_filter = 1
+mouse_default_cursor_shape = 0
+size_flags_horizontal = 1
+size_flags_vertical = 1
+alignment = 0
+_sections_unfolded = [ "Anchor", "Grow Direction", "Margin", "Material", "Rect", "Size Flags", "custom_constants" ]
+
+[node name="Status" type="Label" parent="ConsoleBox/Container" index="0"]
+
+anchor_left = 0.0
+anchor_top = 0.0
+anchor_right = 0.0
+anchor_bottom = 0.0
+margin_right = 1024.0
+margin_bottom = 30.0
+rect_pivot_offset = Vector2( 0, 0 )
+rect_clip_content = false
+mouse_filter = 2
+mouse_default_cursor_shape = 0
+size_flags_horizontal = 3
+size_flags_vertical = 2
+custom_fonts/font = SubResource( 3 )
+custom_colors/font_color = Color( 0.929688, 0.0254211, 0.0254211, 1 )
+text = "This is label."
+align = 1
+valign = 1
+clip_text = true
+percent_visible = 1.0
+lines_skipped = 0
+max_lines_visible = 1
+_sections_unfolded = [ "Anchor", "Grow Direction", "Margin", "Mouse", "Size Flags", "custom_colors", "custom_fonts", "custom_styles" ]
+
+[node name="ConsoleText" type="RichTextLabel" parent="ConsoleBox/Container" index="1"]
+
+anchor_left = 0.0
+anchor_top = 0.0
+anchor_right = 0.0
+anchor_bottom = 0.0
+margin_top = 283.0
+margin_right = 1024.0
+margin_bottom = 562.0
+rect_pivot_offset = Vector2( 0, 0 )
+rect_clip_content = true
+hint_tooltip = "This is the console output."
+focus_mode = 2
+mouse_filter = 0
+mouse_default_cursor_shape = 0
+size_flags_horizontal = 3
+size_flags_vertical = 3
+custom_fonts/normal_font = SubResource( 4 )
+bbcode_enabled = true
+bbcode_text = ""
+visible_characters = -1
+percent_visible = 1.0
+meta_underlined = true
+tab_size = 4
+text = ""
+scroll_active = true
+scroll_following = true
+selection_enabled = true
+override_selected_font_color = false
+_sections_unfolded = [ "BBCode", "Material", "Visibility", "custom_colors", "custom_constants", "custom_fonts", "custom_styles" ]
+
+[node name="LineEdit" type="LineEdit" parent="ConsoleBox/Container" index="2"]
+
+anchor_left = 0.0
+anchor_top = 0.0
+anchor_right = 0.0
+anchor_bottom = 0.0
+margin_top = 566.0
+margin_right = 1024.0
+margin_bottom = 600.0
+rect_pivot_offset = Vector2( 0, 0 )
+rect_clip_content = false
+hint_tooltip = "This is where you type stuff."
+focus_mode = 2
+mouse_filter = 0
+mouse_default_cursor_shape = 1
+size_flags_horizontal = 1
+size_flags_vertical = 1
+custom_fonts/font = SubResource( 5 )
+text = "Line"
+focus_mode = 2
+context_menu_enabled = true
+placeholder_alpha = 0.6
+caret_blink = true
+caret_blink_speed = 0.65
+caret_position = 0
+_sections_unfolded = [ "Anchor", "Caret", "Hint", "Margin", "Placeholder", "custom_colors", "custom_fonts", "custom_styles" ]
+
+[connection signal="meta_clicked" from="ConsoleBox/Container/ConsoleText" to="." method="_on_ConsoleText_meta_clicked"]
+
+[connection signal="text_entered" from="ConsoleBox/Container/LineEdit" to="." method="_on_LineEdit_text_entered"]
+
+
